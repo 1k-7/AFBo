@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  autofilterbot:
+    build: .
+    container_name: af_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
