@@ -12,14 +12,16 @@ class script(object):
 
     FILE_CAPTION = """<b>{file_name}</b>\nSize: <code>{file_size}</code>""" 
 
-    WELCOME_TEXT = """Welcome to {title}, {mention}!"""
-
     HELP_TXT = """<b>Help Menu</b>\n\nYou can search for files here in PM or add me to a group.\n\nUse inline search via <code>@BotUsername query</code>."""
 
     ADMIN_COMMAND_TXT = """<b>Admin Commands:</b>
-/index - Index a channel
+/index - Index a channel (forward msg or send link)
+/2nd [token] - Add secondary bot for indexing logs
 /index_channels - Check indexed channels
 /stats - Bot stats
 /delete [query] - Delete specific files
+/export - Export Database to JSON
+/import - Reply to JSON to Import DB
 /users - List users
-/chats - List groups"""
+/chats - List groups
+/set_fsub [ids] - Set force sub channels"""

@@ -3,3 +3,4 @@ TgCrypto
 aiosqlite
 pytz
 speedtest-cli
+requests

@@ -20,6 +20,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+@Client.on_message(filters.command('help'))
+async def help_cmd(client, message):
+    buttons = [[ InlineKeyboardButton('« ʙᴀᴄᴋ', callback_data='start') ]]
+    text = script.HELP_TXT.format(message.from_user.mention) if '{}' in script.HELP_TXT else script.HELP_TXT
+    await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+@Client.on_message(filters.command('2nd') & filters.user(ADMINS))
+async def set_second_bot(client, message):
+    try: 
+        token = message.text.split(" ", 1)[1].strip()
+    except: 
+        return await message.reply("Usage: `/2nd bot_token_here`")
+    await db.update_bot_sttgs('SECONDARY_BOT_TOKEN', token)
+    await message.reply("✔️ Secondary bot token saved successfully. It will now handle indexing error logs.")
+
 @Client.on_message(filters.command("start") & filters.incoming)
 async def start(client, message):
     if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
@@ -135,9 +150,7 @@ async def start(client, message):
     except Exception as e:
         logger.error(f"Error processing start cmd: {e}")
 
-# ==========================================
-# IMPORT / EXPORT COMMANDS (SQLITE -> JSON)
-# ==========================================
+
 @Client.on_message(filters.command('export') & filters.user(ADMINS))
 async def export_db_cmd(bot, message):
     msg = await message.reply("⏳ Querying Database... This may take a moment.")
@@ -162,7 +175,6 @@ async def export_db_cmd(bot, message):
     except Exception as e:
         logger.error(f"Export Error: {e}", exc_info=True)
         await msg.edit(f"❌ Error during export: {e}")
-
 
 @Client.on_message(filters.command('import') & filters.user(ADMINS))
 async def import_db_cmd(bot, message):
@@ -221,9 +233,6 @@ async def import_db_cmd(bot, message):
         if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
 
-# ==========================================
-# OTHER BOT COMMANDS
-# ==========================================
 @Client.on_message(filters.command('index_channels') & filters.user(ADMINS))
 async def channels_info_cmd(bot, message):
     ids = INDEX_CHANNELS; text = '**Indexed Channels:**\n\n'
