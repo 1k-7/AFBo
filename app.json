@@ -1,0 +1,12 @@
+{
+    "name": "norSearchBot",
+    "description": "A Telegram bot for auto-filtering movies.",
+    "repository": "https://github.com/poi_oomb/myre",
+    "keywords": ["telegram", "bot", "filter"],
+    "buildpacks": [
+      {
+        "url": "nintedaddydekunna/poomyre"
+      }
+    ]
+  }
+  

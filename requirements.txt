@@ -1,0 +1,11 @@
+hydrogram
+tgcrypto
+pymongo[srv]
+cinemagoer
+shortzy
+aiohttp
+aiofiles
+speedtest-cli
+requests
+pytz
+dnspython
