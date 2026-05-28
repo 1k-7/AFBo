@@ -1,6 +1,7 @@
 import aiosqlite
 import json
 import logging
+import os
 from info import DATABASE_FILE
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,20 @@ class Database:
             async with db.execute('SELECT COUNT(*) FROM users') as cursor:
                 return (await cursor.fetchone())[0]
 
+    async def get_all_users(self):
+        await self._init_db()
+        async with aiosqlite.connect(self.db_file) as db:
+            async with db.execute('SELECT id FROM users') as cursor:
+                rows = await cursor.fetchall()
+                # Return list of dicts to keep compatibility with older MongoDB loops
+                return [{"id": row[0]} for row in rows]
+
+    async def delete_user(self, user_id):
+        await self._init_db()
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute('DELETE FROM users WHERE id = ?', (int(user_id),))
+            await db.commit()
+
     async def add_chat(self, chat, title):
         await self._init_db()
         async with aiosqlite.connect(self.db_file) as db:
@@ -50,6 +65,19 @@ class Database:
         async with aiosqlite.connect(self.db_file) as db:
             async with db.execute('SELECT COUNT(*) FROM chats') as cursor:
                 return (await cursor.fetchone())[0]
+
+    async def get_all_chats(self):
+        await self._init_db()
+        async with aiosqlite.connect(self.db_file) as db:
+            async with db.execute('SELECT id FROM chats') as cursor:
+                rows = await cursor.fetchall()
+                return [{"id": row[0]} for row in rows]
+
+    async def delete_chat(self, chat_id):
+        await self._init_db()
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute('DELETE FROM chats WHERE id = ?', (int(chat_id),))
+            await db.commit()
 
     async def get_bot_sttgs(self):
         await self._init_db()
@@ -100,5 +128,23 @@ class Database:
         async with aiosqlite.connect(self.db_file) as db:
             await db.execute('INSERT INTO settings (chat_id, settings_json) VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET settings_json = excluded.settings_json', (chat_id, settings_json))
             await db.commit()
+            
+    async def get_banned(self):
+        stg = await self.get_bot_sttgs()
+        return stg.get("banned_users", []), stg.get("banned_chats", [])
+
+    async def get_data_db_size(self):
+        return os.path.getsize(self.db_file) if os.path.exists(self.db_file) else 0
+
+    async def get_all_files_db_stats(self):
+        size = await self.get_data_db_size()
+        await self._init_db()
+        count = 0
+        async with aiosqlite.connect(self.db_file) as db:
+            try:
+                async with db.execute('SELECT COUNT(*) FROM files') as cursor:
+                    count = (await cursor.fetchone())[0]
+            except Exception: pass
+        return [{'name': 'bot_database.db', 'size': size, 'coll_count': count}]
 
 db = Database(DATABASE_FILE)

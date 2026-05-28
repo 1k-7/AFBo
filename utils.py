@@ -110,3 +110,32 @@ def get_wish():
     if 5 <= hour < 12: return "ɢᴏᴏᴅ ᴍᴏʀɴɪɴɢ ☀️"
     elif 12 <= hour < 18: return "ɢᴏᴏᴅ ᴀꜰᴛᴇʀɴᴏᴏɴ 🌤️"
     else: return "ɢᴏᴏᴅ ᴇᴠᴇɴɪɴɢ 🌙"
+
+async def broadcast_messages(user_id, message, pin=False):
+    try:
+        m = await message.copy(chat_id=user_id)
+        if pin:
+            await m.pin(disable_notification=True)
+        return "Success"
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return await broadcast_messages(user_id, message, pin)
+    except UserNotParticipant:
+        await db.delete_user(int(user_id))
+        return "Error"
+    except Exception:
+        await db.delete_user(int(user_id))
+        return "Error"
+
+async def groups_broadcast_messages(chat_id, message, pin=False):
+    try:
+        k = await message.copy(chat_id=chat_id)
+        if pin:
+            await k.pin(disable_notification=True)
+        return "Success"
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return await groups_broadcast_messages(chat_id, message, pin)
+    except Exception:
+        await db.delete_chat(int(chat_id))
+        return "Error"
