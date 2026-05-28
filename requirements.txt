@@ -2,3 +2,4 @@ hydrogram
 TgCrypto
 aiosqlite
 pytz
+speedtest-cli
