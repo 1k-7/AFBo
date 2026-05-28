@@ -5,7 +5,6 @@ from hydrogram.errors import FloodWait, MessageNotModified
 from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from info import ADMINS, INDEX_EXTENSIONS
 from database.ia_filterdb import save_file 
-from database.users_chats_db import db as data_db
 from utils import temp, get_readable_time
 import logging
 
@@ -103,7 +102,7 @@ async def index_files_to_db_iter(lst_msg_id, chat, msg, bot, skip, replace=False
                     index_stats["unsupported"] += 1; continue
 
                 media.caption = message.caption
-                save_tasks.append(save_file(media, data_db, replace=replace))
+                save_tasks.append(save_file(media, replace=replace))
 
                 if len(save_tasks) >= SAVE_BATCH_SIZE:
                     results = await asyncio.gather(*save_tasks, return_exceptions=True)
@@ -113,7 +112,6 @@ async def index_files_to_db_iter(lst_msg_id, chat, msg, bot, skip, replace=False
                          elif res == 'dup': index_stats["duplicate"] += 1
                     save_tasks = []
 
-            # Process remaining
             if save_tasks:
                 results = await asyncio.gather(*save_tasks, return_exceptions=True)
                 for res in results:
@@ -121,7 +119,6 @@ async def index_files_to_db_iter(lst_msg_id, chat, msg, bot, skip, replace=False
                     elif res == 'suc': index_stats["total_files"] += 1
                     elif res == 'dup': index_stats["duplicate"] += 1
 
-            # Done
             elapsed = time.time() - index_stats["start_time"]
             status = "🛑 Cancelled" if temp.CANCEL else "✔️ Completed"
             final_text = f"{status}!\nProcessed: {index_stats['current'] - skip}\nSaved: {index_stats['total_files']}\nDuplicates: {index_stats['duplicate']}\nErrors: {index_stats['errors']}\nTime: {get_readable_time(elapsed)}"
