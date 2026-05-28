@@ -1,13 +1,9 @@
 import logging
-from struct import pack
 import re
-import base64
 import asyncio
 from functools import partial
-from hydrogram.file_id import FileId
-from hydrogram import enums
 from pymongo import MongoClient, TEXT
-from pymongo.errors import DuplicateKeyError, OperationFailure, BulkWriteError 
+from pymongo.errors import DuplicateKeyError, OperationFailure
 from info import (
     DATABASE_URIS, DATABASE_NAME, COLLECTION_NAME,
     USE_CAPTION_FILTER, MAX_BTN, DB_MAX_SIZE_MB
@@ -68,7 +64,6 @@ async def get_active_collection_with_index(data_db):
         db_stats = await loop.run_in_executor(None, data_db.get_all_files_db_stats)
         
         if not db_stats or len(db_stats) != len(file_db_collections):
-            logger.error("DB stats count mismatch or fetch error. Defaulting to first DB.")
             return file_db_collections[0], 0
 
         for i in range(current_index, len(file_db_collections)):
@@ -77,7 +72,6 @@ async def get_active_collection_with_index(data_db):
             
             if stat and stat.get('size', 0) < DB_MAX_SIZE_BYTES:
                 if i != current_index:
-                    logger.info(f"DB #{current_index+1} is full. Switching active DB to #{i+1}.")
                     await loop.run_in_executor(None, data_db.update_bot_sttgs, 'CURRENT_DB_INDEX', i)
                 return coll, i 
 
@@ -87,38 +81,29 @@ async def get_active_collection_with_index(data_db):
                 stat = next((s for s in db_stats if s.get('coll_name') == coll.name and s.get('db_name') == coll.database.name), None)
                 
                 if stat and stat.get('size', 0) < DB_MAX_SIZE_BYTES:
-                    logger.info(f"All subsequent DBs full. Switching back to active DB #{i+1}.")
                     await loop.run_in_executor(None, data_db.update_bot_sttgs, 'CURRENT_DB_INDEX', i)
                     return coll, i
 
-        logger.critical("All file databases are full!")
         return None, -1
-
     except Exception as e:
-        logger.error(f"Error getting active collection: {e}", exc_info=True)
+        logger.error(f"Error getting active collection: {e}")
         return file_db_collections[0], 0 
 
 def get_total_files_count():
      if not file_db_collections: return 0
      total_count = 0
      for collection in file_db_collections:
-         try:
-             total_count += collection.count_documents({})
-         except Exception as e:
-             logger.error(f"Error counting DB {collection.database.name}: {e}")
+         try: total_count += collection.count_documents({})
+         except: pass
      return total_count
 
 db_count_documents = get_total_files_count
 
 async def save_file(media, data_db, replace=False):
     loop = asyncio.get_running_loop()
-    
     active_coll, active_index = await get_active_collection_with_index(data_db)
-    if active_coll is None:
-        logger.critical("All databases are full. Cannot save file.")
-        return 'err'
+    if active_coll is None: return 'err'
 
-    db_name_log = f"Active DB #{active_index + 1}"
     file_id = media.file_id
     if not file_id: return 'err'
 
@@ -142,63 +127,39 @@ async def save_file(media, data_db, replace=False):
     if replace:
         try:
             delete_query = {'file_name': file_name, 'file_size': document['file_size']}
-            del_tasks = [
-                loop.run_in_executor(None, partial(coll.delete_one, delete_query))
-                for coll in file_db_collections
-            ]
+            del_tasks = [loop.run_in_executor(None, partial(coll.delete_one, delete_query)) for coll in file_db_collections]
             await asyncio.gather(*del_tasks)
-        except Exception as e:
-            logger.error(f"Error during replace deletion: {e}")
+        except: pass
 
     if not replace:
         collections_to_check = [coll for i, coll in enumerate(file_db_collections) if i != active_index]
         if collections_to_check:
             try:
-                query_filter = {
-                    '$or': [
-                        {'_id': document['_id']},
-                        {'file_name': document['file_name'], 'file_size': document['file_size']}
-                    ]
-                }
-                find_tasks = [
-                    loop.run_in_executor(None, partial(coll.find_one, query_filter, {'_id': 1}))
-                    for coll in collections_to_check
-                ]
+                query_filter = {'$or': [{'_id': document['_id']}, {'file_name': document['file_name'], 'file_size': document['file_size']}]}
+                find_tasks = [loop.run_in_executor(None, partial(coll.find_one, query_filter, {'_id': 1})) for coll in collections_to_check]
                 duplicates = await asyncio.gather(*find_tasks)
-                if any(duplicates):
-                    return 'dup'
-            except Exception as e:
-                logger.error(f"Error checking other DBs for duplicates: {e}")
+                if any(duplicates): return 'dup'
+            except: pass
     
     try:
         await loop.run_in_executor(None, partial(active_coll.insert_one, document))
-        logger.info(f'Saved [{get_size(document["file_size"])}] to {db_name_log}: {document["file_name"]}')
         return 'suc'
     except DuplicateKeyError:
         return 'dup'
-    except OperationFailure as e:
-         if e.code == 8000:
-             logger.warning(f"{db_name_log} is FULL. File *not* saved. Active DB will switch on next save.")
-             return 'err'
-         else:
-             logger.error(f"MongoDB Operation Failure on {db_name_log}: {e}")
-             return 'err'
-    except Exception as e:
-        logger.error(f"Unexpected error saving file to {db_name_log}: {e}", exc_info=True)
+    except OperationFailure:
+        return 'err'
+    except:
         return 'err'
 
-async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None):
+async def get_search_results(query, max_results=MAX_BTN, offset=0):
     loop = asyncio.get_running_loop()
     query = str(query).strip()
     if not query: return [], '', 0
 
     words = [re.escape(word) for word in query.split()]
     raw_pattern = r'\b' + r'.*?\b'.join(words) + r'.*'
-    try:
-        regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except re.error:
-        simple_regex_pattern = r".*".join(words)
-        regex = re.compile(simple_regex_pattern, flags=re.IGNORECASE)
+    try: regex = re.compile(raw_pattern, flags=re.IGNORECASE)
+    except re.error: regex = re.compile(r".*".join(words), flags=re.IGNORECASE)
 
     filter_query = {'file_name': regex}
     if USE_CAPTION_FILTER:
@@ -211,10 +172,8 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None):
         try:
             cursor = db_collection.find(q_filter) 
             docs = await loop.run_in_executor(None, list, cursor)
-            count = len(docs)
-            return docs, count
-        except Exception as e:
-            logger.error(f"Database query error ({db_collection.database.name}): {e}"); return [], 0
+            return docs, len(docs)
+        except: return [], 0
 
     find_tasks = [run_find(collection, filter_query) for collection in file_db_collections]
     all_db_results = await asyncio.gather(*find_tasks)
@@ -223,33 +182,21 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None):
         results.extend(docs)
         total_results += count
 
-    if lang:
-        lang = lang.lower()
-        lang_files = [
-            f for f in results
-            if lang in f.get('file_name', '').lower() or lang in f.get('caption', '').lower()
-        ]
-        total_results = len(lang_files)
-        files_to_return = lang_files[offset : offset + max_results]
-    else:
-        files_to_return = results[offset : offset + max_results]
-
+    files_to_return = results[offset : offset + max_results]
     next_offset_val = offset + len(files_to_return)
     next_offset_str = str(next_offset_val) if next_offset_val < total_results else ''
 
     return files_to_return, next_offset_str, total_results
 
 async def delete_files(query):
-    loop = asyncio.get_running_loop(); total_deleted = 0
+    loop = asyncio.get_running_loop()
     query = str(query).strip()
     if not query: return 0
 
     words = [re.escape(word) for word in query.split()]
     raw_pattern = r'\b' + r'.*?\b'.join(words) + r'.*'
     try: regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except re.error: 
-        simple_regex_pattern = r".*".join(words)
-        regex = re.compile(simple_regex_pattern, flags=re.IGNORECASE)
+    except: regex = re.compile(r".*".join(words), flags=re.IGNORECASE)
         
     filter_query = {'file_name': regex}
 
@@ -258,26 +205,17 @@ async def delete_files(query):
         try:
             result = await loop.run_in_executor(None, partial(db_collection.delete_many, q_filter))
             return result.deleted_count if result else 0
-        except Exception as e:
-            logger.error(f"Error deleting from {db_collection.database.name}: {e}"); return 0
+        except: return 0
 
     delete_tasks = [run_delete(collection, filter_query) for collection in file_db_collections]
     deleted_counts = await asyncio.gather(*delete_tasks)
-    total_deleted = sum(deleted_counts)
-
-    logger.info(f"Deleted {total_deleted} files matching query: '{query}' from all DBs.")
-    return total_deleted
+    return sum(deleted_counts)
 
 async def get_file_details(query_id):
     loop = asyncio.get_running_loop()
     for collection in file_db_collections:
-        file_details = None
         try:
             file_details = await loop.run_in_executor(None, partial(collection.find_one, {'_id': query_id}))
-        except Exception as e:
-            logger.error(f"Error find_one in {collection.database.name} ({query_id}): {e}")
-        
-        if file_details:
-            return [file_details]
-            
+            if file_details: return [file_details]
+        except: pass
     return []
