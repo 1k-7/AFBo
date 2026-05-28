@@ -6,6 +6,8 @@ from info import DATABASE_FILE, USE_CAPTION_FILTER, MAX_BTN
 logger = logging.getLogger(__name__)
 _db_initialized = False
 
+file_db_collections = []
+
 def get_size(size_bytes):
     if size_bytes is None or not isinstance(size_bytes, (int, float)) or size_bytes < 0: return "0 B"
     size = float(size_bytes); units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"]; i = 0
@@ -35,22 +37,21 @@ async def get_total_files_count():
             row = await cursor.fetchone()
             return row[0] if row else 0
 
+db_count_documents = get_total_files_count
+
 async def save_file(media, replace=False):
     await _init_db()
     file_id = media.file_id
     if not file_id: return 'err'
-
     raw_file_name = str(media.file_name) if getattr(media, 'file_name', None) else "UnknownFile"
     file_name = re.sub(r"[@\(\)\[\]]", "", raw_file_name.strip())
     file_name = re.sub(r"(_|\-|\.|\+)+", " ", file_name)
     file_name = re.sub(r'\s+', ' ', file_name).strip()
-
     caption_text = str(media.caption) if getattr(media, 'caption', None) else ""
     file_caption = re.sub(r"@\w+|(_|\-|\.|\+)|https?://\S+", " ", caption_text).strip()
     file_caption = re.sub(r'\s+', ' ', file_caption)
-
     file_size = getattr(media, 'file_size', 0) or 0
-
+    
     async with aiosqlite.connect(DATABASE_FILE) as db:
         if replace:
             await db.execute('DELETE FROM files WHERE file_name = ? AND file_size = ?', (file_name, file_size))
@@ -62,20 +63,15 @@ async def save_file(media, replace=False):
             await db.execute('INSERT INTO files (file_id, file_name, file_size, caption) VALUES (?, ?, ?, ?)', (file_id, file_name, file_size, file_caption))
             await db.commit()
             return 'suc'
-        except aiosqlite.IntegrityError:
-            return 'dup'
-        except Exception as e:
-            logger.error(f"Error saving file: {e}")
+        except:
             return 'err'
 
-async def get_search_results(query, max_results=MAX_BTN, offset=0):
+async def get_search_results(query, max_results=MAX_BTN, offset=0, **kwargs):
     await _init_db()
     query = str(query).strip()
     if not query: return [], '', 0
-
     words = query.split()
     like_query = '%' + '%'.join(words) + '%'
-    
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         if USE_CAPTION_FILTER:
@@ -84,23 +80,17 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0):
         else:
             sql = 'SELECT * FROM files WHERE file_name LIKE ?'
             params = (like_query,)
-
         count_sql = sql.replace('SELECT *', 'SELECT COUNT(*)')
         async with db.execute(count_sql, params) as cursor:
             total_results = (await cursor.fetchone())[0]
-
         sql += ' LIMIT ? OFFSET ?'
         params += (max_results, offset)
-        
         async with db.execute(sql, params) as cursor:
             rows = await cursor.fetchall()
             results = [dict(row) for row in rows]
-            for r in results:
-                r['_id'] = r['file_id']
-
+            for r in results: r['_id'] = r['file_id']
     next_offset_val = offset + len(results)
     next_offset_str = str(next_offset_val) if next_offset_val < total_results else ''
-
     return results, next_offset_str, total_results
 
 async def delete_files(query):
@@ -109,7 +99,6 @@ async def delete_files(query):
     if not query: return 0
     words = query.split()
     like_query = '%' + '%'.join(words) + '%'
-    
     async with aiosqlite.connect(DATABASE_FILE) as db:
         async with db.execute('DELETE FROM files WHERE file_name LIKE ?', (like_query,)) as cursor:
             deleted_count = cursor.rowcount

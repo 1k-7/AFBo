@@ -45,7 +45,6 @@ class Database:
         async with aiosqlite.connect(self.db_file) as db:
             async with db.execute('SELECT id FROM users') as cursor:
                 rows = await cursor.fetchall()
-                # Return list of dicts to keep compatibility with older MongoDB loops
                 return [{"id": row[0]} for row in rows]
 
     async def delete_user(self, user_id):
