@@ -15,10 +15,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Standard Index Globals
 index_queue = []
 is_indexing = False
 current_index_job = None
+
+# Smart & Multi Index Globals
 smart_index_state = {}
+active_smart_jobs = {} # Tracks live progress for the status button
 
 class UserbotPool:
     def __init__(self, sessions, api_id, api_hash, main_bot=None):
@@ -78,6 +82,10 @@ def send_error_log(token, text):
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         logger.error(f"Failed to send log via secondary bot: {e}")
+
+# ================================
+# SMART & MULTI INDEX ENGINE
+# ================================
 
 @Client.on_message(filters.command('indexhelper') & filters.user(ADMINS))
 async def add_helper(client, message):
@@ -171,6 +179,7 @@ async def handle_no_json(bot, query: CallbackQuery):
     
     stg = await data_db.get_bot_sttgs()
     sessions = stg.get("INDEX_SESSIONS", [])
+    sec_token = stg.get('SECONDARY_BOT_TOKEN')
     
     pool = UserbotPool(sessions, API_ID, API_HASH, main_bot=bot)
     helpers_count = await pool.start_all()
@@ -182,27 +191,52 @@ async def handle_no_json(bot, query: CallbackQuery):
         except Exception: pass
 
     sub_bots = []
-    if job_type == 'multiindex':
+    stats_dict = {}
+    
+    if job_type == 'smartindex':
+        stats_dict["Main Bot"] = {"saved": 0, "dup": 0, "err": 0}
+    elif job_type == 'multiindex':
         tokens = state['tokens']
         for token in tokens:
             try:
                 b = Client(f"sub_{token.split(':')[0]}", bot_token=token, api_id=API_ID, api_hash=API_HASH, in_memory=True)
                 await b.start()
                 sub_bots.append(b)
+                stats_dict[b.me.username] = {"saved": 0, "dup": 0, "err": 0}
             except Exception as e:
                 await query.message.reply(f"❌ Failed to start sub-bot: {e}")
         if not sub_bots:
             await pool.stop_all(main_bot=bot)
             return await query.message.edit("❌ No active sub-bots. Aborting.")
             
+    # Setup global tracking
+    active_smart_jobs[user_id] = {
+        "chat_name": chat_name,
+        "chat_id": chat_id,
+        "job_type": job_type,
+        "start_time": time.time(),
+        "total_to_process": last_msg_id,
+        "current": 0,
+        "scanned_files": 0,
+        "helpers": helpers_count,
+        "sub_bots": len(sub_bots),
+        "stats": stats_dict,
+        "cancel": False,
+        "mode": "Dynamic Scan & Save"
+    }
+    
+    btn = [[InlineKeyboardButton("🔄 Update Status", callback_data=f"smart_status_{user_id}")],
+           [InlineKeyboardButton("❌ Cancel", callback_data=f"smart_cancel_{user_id}")]]
+    sts = await query.message.reply(f"🚀 **Started Dynamic Indexing**\n**Target:** {chat_name}\n\nClick 'Update Status' below to view progress.", reply_markup=InlineKeyboardMarkup(btn))
+    
     valid_ids = []
     chunk_size = 200
     current_id = 1
-    saved_files = 0
-    
-    sts = await query.message.reply(f"🚀 **Dynamic Indexing `{chat_name}`**\nHelpers: {helpers_count}\nSub-bots: {len(sub_bots)}\n\nFetching and saving simultaneously...")
+    loop = asyncio.get_running_loop()
     
     while current_id <= last_msg_id:
+        if active_smart_jobs[user_id]["cancel"]: break
+        
         c, wait_time = pool.get_client()
         if wait_time > 0:
             await asyncio.sleep(wait_time)
@@ -211,7 +245,7 @@ async def handle_no_json(bot, query: CallbackQuery):
         chunk = list(range(current_id, min(current_id + chunk_size, last_msg_id + 1)))
         batch_valid_ids = []
         
-        # 1. SCAN PHASE (Userbot finds messages with media)
+        # 1. SCAN PHASE
         try:
             msgs = await c.get_messages(chat_id, chunk)
             for m in msgs:
@@ -228,7 +262,9 @@ async def handle_no_json(bot, query: CallbackQuery):
         except Exception:
             pass
 
-        # 2. SAVE PHASE (Bots grab the specific valid files directly)
+        active_smart_jobs[user_id]["scanned_files"] = len(valid_ids)
+
+        # 2. SAVE PHASE
         if batch_valid_ids:
             if job_type == 'smartindex':
                 try:
@@ -238,9 +274,13 @@ async def handle_no_json(bot, query: CallbackQuery):
                         media = getattr(m, m.media.value, None) if m.media else None
                         if media:
                             res = await save_file(media, replace=True)
-                            if res == 'suc': saved_files += 1
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
+                            if res == 'suc': active_smart_jobs[user_id]["stats"]["Main Bot"]["saved"] += 1
+                            elif res == 'dup': active_smart_jobs[user_id]["stats"]["Main Bot"]["dup"] += 1
+                            else: 
+                                active_smart_jobs[user_id]["stats"]["Main Bot"]["err"] += 1
+                                if sec_token: loop.run_in_executor(None, send_error_log, sec_token, f"Save Error Main Bot")
+                except FloodWait as e: await asyncio.sleep(e.value)
+                except Exception: pass
                     
             elif job_type == 'multiindex':
                 for b in sub_bots:
@@ -252,19 +292,16 @@ async def handle_no_json(bot, query: CallbackQuery):
                             media = getattr(m, m.media.value, None) if m.media else None
                             if media:
                                 res = await save_file_custom(media, db_name, replace=True)
-                                if res == 'suc' and b == sub_bots[0]: saved_files += 1 
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-                    except Exception:
-                        pass
+                                if res == 'suc': active_smart_jobs[user_id]["stats"][b.me.username]["saved"] += 1
+                                elif res == 'dup': active_smart_jobs[user_id]["stats"][b.me.username]["dup"] += 1
+                                else: active_smart_jobs[user_id]["stats"][b.me.username]["err"] += 1
+                    except FloodWait as e: await asyncio.sleep(e.value)
+                    except Exception: pass
 
         current_id += chunk_size
-        
-        # Update progress 
-        if current_id % 1000 < chunk_size or current_id >= last_msg_id:
-            try: await sts.edit(f"🚀 **Dynamic Indexing...**\n\n**Progress:** {min(current_id, last_msg_id)} / {last_msg_id}\n**Saved Files:** {saved_files}")
-            except: pass
+        active_smart_jobs[user_id]["current"] = min(current_id, last_msg_id)
 
+    # Cleanup
     await pool.stop_all(main_bot=bot)
     for b in sub_bots:
         try: await b.stop()
@@ -274,30 +311,76 @@ async def handle_no_json(bot, query: CallbackQuery):
     with open(json_file, "w") as f:
         json.dump(valid_ids, f)
         
-    await query.message.reply_document(json_file, caption=f"✔️ Completed! Total Valid Files: {len(valid_ids)}\nSaved to DB(s) successfully.")
+    final_text = f"✔️ **Dynamic Indexing Completed**\n" if not active_smart_jobs[user_id]["cancel"] else f"🛑 **Cancelled**\n"
+    final_text += f"**Chat:** {chat_name}\n**Scanned Messages:** {active_smart_jobs[user_id]['current']}\n**Found Valid Media:** {len(valid_ids)}"
+    await sts.edit(final_text)
+    
+    await query.message.reply_document(json_file, caption=f"✔️ JSON Backup generated!\nStored {len(valid_ids)} media IDs.")
     os.remove(json_file)
+    del active_smart_jobs[user_id]
     del smart_index_state[user_id]
 
 
 async def execute_smart_multi_index(client, message, state):
+    user_id = message.from_user.id
     valid_ids = state['valid_ids']
     chat_id = state['chat_id']
+    chat_name = state['chat_name']
     job_type = state['type']
     
     if not valid_ids:
         return await message.reply("❌ No valid files to index.")
         
-    sts = await message.reply(f"🚀 Starting File ID Fetching Phase for {len(valid_ids)} files from JSON...")
+    stg = await data_db.get_bot_sttgs()
+    sec_token = stg.get('SECONDARY_BOT_TOKEN')
+    
+    sub_bots = []
+    stats_dict = {}
     
     if job_type == 'smartindex':
-        stg = await data_db.get_bot_sttgs()
+        stats_dict["Main Bot"] = {"saved": 0, "dup": 0, "err": 0}
         sessions = stg.get("INDEX_SESSIONS", [])
         pool = UserbotPool(sessions, API_ID, API_HASH, main_bot=client)
-        await pool.start_all()
-        
-        saved = 0
+        helpers_count = await pool.start_all()
+    elif job_type == 'multiindex':
+        tokens = state['tokens']
+        helpers_count = 0
+        for token in tokens:
+            try:
+                b = Client(f"sub_{token.split(':')[0]}", bot_token=token, api_id=API_ID, api_hash=API_HASH, in_memory=True)
+                await b.start()
+                sub_bots.append(b)
+                stats_dict[b.me.username] = {"saved": 0, "dup": 0, "err": 0}
+            except Exception as e:
+                await message.reply(f"❌ Failed to start sub-bot: {e}")
+        if not sub_bots:
+            return await message.reply("❌ No active sub-bots. Aborting.")
+            
+    active_smart_jobs[user_id] = {
+        "chat_name": chat_name,
+        "chat_id": chat_id,
+        "job_type": job_type,
+        "start_time": time.time(),
+        "total_to_process": len(valid_ids),
+        "current": 0,
+        "scanned_files": len(valid_ids), # From JSON
+        "helpers": helpers_count,
+        "sub_bots": len(sub_bots),
+        "stats": stats_dict,
+        "cancel": False,
+        "mode": "JSON Fetch & Save"
+    }
+
+    btn = [[InlineKeyboardButton("🔄 Update Status", callback_data=f"smart_status_{user_id}")],
+           [InlineKeyboardButton("❌ Cancel", callback_data=f"smart_cancel_{user_id}")]]
+    sts = await message.reply(f"🚀 **Started JSON Indexing**\n**Target:** {chat_name}\n\nClick 'Update Status' below to view progress.", reply_markup=InlineKeyboardMarkup(btn))
+    
+    loop = asyncio.get_running_loop()
+    
+    if job_type == 'smartindex':
         i = 0
         while i < len(valid_ids):
+            if active_smart_jobs[user_id]["cancel"]: break
             c, wait_time = pool.get_client()
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
@@ -311,42 +394,26 @@ async def execute_smart_multi_index(client, message, state):
                     media = getattr(m, m.media.value, None) if m.media else None
                     if media:
                         res = await save_file(media, replace=True)
-                        if res == 'suc': saved += 1
+                        if res == 'suc': active_smart_jobs[user_id]["stats"]["Main Bot"]["saved"] += 1
+                        elif res == 'dup': active_smart_jobs[user_id]["stats"]["Main Bot"]["dup"] += 1
+                        else: active_smart_jobs[user_id]["stats"]["Main Bot"]["err"] += 1
                 i += 200
-                if i % 1000 == 0:
-                    try: await sts.edit(f"Fetching... ({i}/{len(valid_ids)})\nSaved: {saved}")
-                    except: pass
+                active_smart_jobs[user_id]["current"] = min(i, len(valid_ids))
             except FloodWait as e:
                 pool.set_cooldown(c, e.value)
                 continue
             except Exception:
                 i += 200
+                active_smart_jobs[user_id]["current"] = min(i, len(valid_ids))
                 
         await pool.stop_all(main_bot=client)
-        await sts.edit(f"✔️ Smart Index Complete! Saved {saved} files to Main DB.")
 
     elif job_type == 'multiindex':
-        tokens = state['tokens']
-        sub_bots = []
-        for token in tokens:
-            try:
-                b = Client(f"sub_{token.split(':')[0]}", bot_token=token, api_id=API_ID, api_hash=API_HASH, in_memory=True)
-                await b.start()
-                sub_bots.append(b)
-            except Exception as e:
-                await message.reply(f"❌ Failed to start sub-bot: {e}")
-                
-        if not sub_bots:
-            return await sts.edit("❌ No active sub-bots.")
-            
-        await sts.edit(f"🚀 Fetching for {len(sub_bots)} sub-bots simultaneously. Ensure they are Admins in the source chat!")
-        
         for b in sub_bots:
-            saved = 0
+            if active_smart_jobs[user_id]["cancel"]: break
             db_name = f"multi_{b.me.username}.db"
-            bot_sts = await message.reply(f"🤖 Fetching for @{b.me.username}...")
-            
             for i in range(0, len(valid_ids), 200):
+                if active_smart_jobs[user_id]["cancel"]: break
                 chunk = valid_ids[i:i+200]
                 try:
                     msgs = await b.get_messages(chat_id, chunk)
@@ -355,15 +422,80 @@ async def execute_smart_multi_index(client, message, state):
                         media = getattr(m, m.media.value, None) if m.media else None
                         if media:
                             res = await save_file_custom(media, db_name, replace=True)
-                            if res == 'suc': saved += 1
+                            if res == 'suc': active_smart_jobs[user_id]["stats"][b.me.username]["saved"] += 1
+                            elif res == 'dup': active_smart_jobs[user_id]["stats"][b.me.username]["dup"] += 1
+                            else: active_smart_jobs[user_id]["stats"][b.me.username]["err"] += 1
+                    active_smart_jobs[user_id]["current"] = min(i + 200, len(valid_ids))
                 except FloodWait as e:
                     await asyncio.sleep(e.value)
                 except Exception:
                     pass
-            await bot_sts.edit(f"✔️ Finished @{b.me.username} - Saved {saved} files to `{db_name}`.")
             await b.stop()
-        
-        await sts.edit("✔️ Multi-Index Complete! Use `/exportmulti` to download DBs.")
+            active_smart_jobs[user_id]["current"] = 0 # Reset counter for next bot
+
+    final_text = f"✔️ **JSON Indexing Completed**\n" if not active_smart_jobs[user_id]["cancel"] else f"🛑 **Cancelled**\n"
+    final_text += f"**Chat:** {chat_name}\n**Total Processed:** {len(valid_ids)}"
+    await sts.edit(final_text)
+    del active_smart_jobs[user_id]
+
+
+# Status Button Callback for Smart/Multi Indexing
+@Client.on_callback_query(filters.regex(r"^smart_status_"))
+async def smart_status_update(bot, query: CallbackQuery):
+    user_id = int(query.data.split("_")[2])
+    if user_id not in active_smart_jobs:
+        return await query.answer("No active process.", show_alert=True)
+    
+    state = active_smart_jobs[user_id]
+    elapsed = time.time() - state["start_time"]
+    progress = state["current"]
+    total = state["total_to_process"]
+    percent = (progress / total * 100) if total > 0 else 0
+    
+    eta = 0
+    if progress > 0 and elapsed > 0:
+        speed = progress / elapsed
+        rem = total - progress
+        eta = rem / speed if speed > 0 else 0
+
+    text = f"🚀 **{state['mode']} In Progress**\n"
+    text += f"**Chat:** {state['chat_name']} (`{state['chat_id']}`)\n\n"
+    text += f"**Progress:** {progress}/{total} ({percent:.1f}%)\n"
+    text += f"**Time Elapsed:** {get_readable_time(elapsed)}\n"
+    text += f"**ETA:** {get_readable_time(eta)}\n\n"
+    
+    if state['mode'] == "Dynamic Scan & Save":
+        text += f"**Helpers Active:** {state['helpers']}\n"
+        text += f"**Valid Files Found:** {state['scanned_files']}\n\n"
+    
+    for bot_name, stats in state["stats"].items():
+        text += f"🤖 **{bot_name}**\n"
+        text += f"├ Saved: {stats['saved']}\n"
+        text += f"├ Duplicates: {stats['dup']}\n"
+        text += f"└ Errors: {stats['err']}\n\n"
+
+    btn = [[InlineKeyboardButton("🔄 Update Status", callback_data=f"smart_status_{user_id}")],
+           [InlineKeyboardButton("❌ Cancel", callback_data=f"smart_cancel_{user_id}")]]
+           
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
+        await query.answer("Status Updated!", show_alert=False)
+    except MessageNotModified:
+        await query.answer("No new changes.", show_alert=False)
+    except FloodWait as e:
+        await query.answer(f"Flood wait... {e.value}s", show_alert=True)
+
+@Client.on_callback_query(filters.regex(r"^smart_cancel_"))
+async def smart_cancel_process(bot, query: CallbackQuery):
+    user_id = int(query.data.split("_")[2])
+    if query.from_user.id != user_id:
+        return await query.answer("Not your process.", show_alert=True)
+    if user_id in active_smart_jobs:
+        active_smart_jobs[user_id]["cancel"] = True
+        await query.answer("Cancellation requested...", show_alert=True)
+    else:
+        await query.answer("Process not found.", show_alert=True)
+
 
 @Client.on_message(filters.command('exportmulti') & filters.user(ADMINS))
 async def export_multi_cmd(client, message):
@@ -394,6 +526,11 @@ async def export_multi_cmd(client, message):
             await message.reply(f"❌ Error exporting {db_file}: {e}")
             
     await sts.delete()
+
+
+# ================================
+# BASIC INDEX ENGINE (Queue)
+# ================================
 
 @Client.on_message(filters.command(['index', 'indexrc']) & filters.private & filters.user(ADMINS))
 async def send_for_index(bot, message):
