@@ -5,8 +5,7 @@ from info import DATABASE_FILE, USE_CAPTION_FILTER, MAX_BTN
 
 logger = logging.getLogger(__name__)
 _db_initialized = False
-
-file_db_collections = []
+_custom_dbs_initialized = set()
 
 def get_size(size_bytes):
     if size_bytes is None or not isinstance(size_bytes, (int, float)) or size_bytes < 0: return "0 B"
@@ -30,6 +29,21 @@ async def _init_db():
         await db.commit()
     _db_initialized = True
 
+async def _init_custom_db(db_path):
+    if db_path in _custom_dbs_initialized: return
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                file_id TEXT PRIMARY KEY,
+                file_name TEXT,
+                file_size INTEGER,
+                caption TEXT
+            )
+        ''')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_file_name ON files(file_name)')
+        await db.commit()
+    _custom_dbs_initialized.add(db_path)
+
 async def get_total_files_count():
     await _init_db()
     async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -40,19 +54,24 @@ async def get_total_files_count():
 db_count_documents = get_total_files_count
 
 async def save_file(media, replace=False):
-    await _init_db()
+    return await save_file_custom(media, DATABASE_FILE, replace)
+
+async def save_file_custom(media, db_path, replace=False):
+    await _init_custom_db(db_path)
     file_id = media.file_id
     if not file_id: return 'err'
+    
     raw_file_name = str(media.file_name) if getattr(media, 'file_name', None) else "UnknownFile"
     file_name = re.sub(r"[@\(\)\[\]]", "", raw_file_name.strip())
     file_name = re.sub(r"(_|\-|\.|\+)+", " ", file_name)
     file_name = re.sub(r'\s+', ' ', file_name).strip()
+    
     caption_text = str(media.caption) if getattr(media, 'caption', None) else ""
     file_caption = re.sub(r"@\w+|(_|\-|\.|\+)|https?://\S+", " ", caption_text).strip()
     file_caption = re.sub(r'\s+', ' ', file_caption)
     file_size = getattr(media, 'file_size', 0) or 0
     
-    async with aiosqlite.connect(DATABASE_FILE) as db:
+    async with aiosqlite.connect(db_path) as db:
         if replace:
             await db.execute('DELETE FROM files WHERE file_name = ? AND file_size = ?', (file_name, file_size))
         else:

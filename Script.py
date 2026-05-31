@@ -15,13 +15,17 @@ class script(object):
     HELP_TXT = """<b>Help Menu</b>\n\nYou can search for files here in PM or add me to a group.\n\nUse inline search via <code>@BotUsername query</code>."""
 
     ADMIN_COMMAND_TXT = """<b>Admin Commands:</b>
-/index - Index a channel (forward msg or send link)
+/index - Basic index a channel (forward msg or send link)
+/indexhelper [string] - Add Pyrogram Session for rotation
+/smartindex - Index using userbots & JSON backup
+/multiindex [token1,token2] - Index with multiple bots
+/exportmulti - Export all multi-index databases
 /2nd [token] - Add secondary bot for indexing logs
 /index_channels - Check indexed channels
 /stats - Bot stats
 /delete [query] - Delete specific files
-/export - Export Database to JSON
-/import - Reply to JSON to Import DB
+/export - Export Main DB to JSON
+/import - Reply to JSON to Import Main DB
 /users - List users
 /chats - List groups
 /set_fsub [ids] - Set force sub channels"""

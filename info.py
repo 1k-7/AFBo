@@ -30,6 +30,11 @@ FILMS_LINK = environ.get('FILMS_LINK', '')
 
 # DB 
 DATABASE_FILE = environ.get('DATABASE_FILE', 'bot_database.db')
+DATABASE_URIS = environ.get('DATABASE_URIS', '')
+DATA_DATABASE_URL = environ.get('DATA_DATABASE_URL', '')
+DATABASE_NAME = environ.get('DATABASE_NAME', 'FilesDB')
+COLLECTION_NAME = environ.get('COLLECTION_NAME', 'Files')
+DB_MAX_SIZE_MB = int(environ.get('DB_MAX_SIZE_MB', 460))
 
 # Configs
 TIME_ZONE = environ.get('TIME_ZONE', 'UTC')
@@ -38,6 +43,7 @@ CACHE_TIME = int(environ.get('CACHE_TIME', 300))
 MAX_BTN = int(environ.get('MAX_BTN', 8))
 INDEX_EXTENSIONS = [ext.lower().strip().lstrip('.') for ext in environ.get('INDEX_EXTENSIONS', 'mkv mp4 pdf zip rar apk 7z txt docx').split()]
 PM_FILE_DELETE_TIME = int(environ.get('PM_FILE_DELETE_TIME', 3600))
+PORT = int(environ.get('PORT', '8080'))
 
 # Visuals/Texts
 PICS = (environ.get('PICS', 'https://files.catbox.moe/e0a7rw.png')).split()
@@ -53,7 +59,7 @@ WELCOME = is_enabled('WELCOME', False)
 SPELL_CHECK = is_enabled("SPELL_CHECK", False)
 LONG_IMDB_DESCRIPTION = is_enabled("LONG_IMDB_DESCRIPTION", False)
 
-# Dummy variables for backward compatibility with old plugins
+# Dummy variables for backward compatibility
 URL = environ.get("URL", "")
 BIN_CHANNEL = int(environ.get("BIN_CHANNEL", 0))
 IS_STREAM = is_enabled('IS_STREAM', False)

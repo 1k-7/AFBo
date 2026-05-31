@@ -14,13 +14,11 @@ def is_banned(query: InlineQuery):
 async def inline_search(bot, query: InlineQuery):
     user_id = query.from_user.id if query.from_user else 0
 
-    # Fsub Check
     is_fsub = await is_subscribed(bot, query)
     if is_fsub:
         await query.answer(results=[], cache_time=0, switch_pm_text="⚠️ Join channel(s) first!", switch_pm_parameter="inline_fsub")
         return
 
-    # Banned Check
     if is_banned(query):
         await query.answer(results=[], cache_time=0, switch_pm_text="🚫 You're banned!", switch_pm_parameter="start")
         return
