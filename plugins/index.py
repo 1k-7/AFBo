@@ -264,7 +264,7 @@ async def handle_no_json(bot, query: CallbackQuery):
 
         active_smart_jobs[user_id]["scanned_files"] = len(valid_ids)
 
-        # 2. SAVE PHASE
+        # 2. SAVE PHASE (PARALLELIZED)
         if batch_valid_ids:
             if job_type == 'smartindex':
                 try:
@@ -283,7 +283,8 @@ async def handle_no_json(bot, query: CallbackQuery):
                 except Exception: pass
                     
             elif job_type == 'multiindex':
-                for b in sub_bots:
+                # Concurrent Fetching for Sub-bots
+                async def process_sub_bot(b):
                     db_name = f"multi_{b.me.username}.db"
                     try:
                         b_msgs = await b.get_messages(chat_id, batch_valid_ids)
@@ -295,8 +296,13 @@ async def handle_no_json(bot, query: CallbackQuery):
                                 if res == 'suc': active_smart_jobs[user_id]["stats"][b.me.username]["saved"] += 1
                                 elif res == 'dup': active_smart_jobs[user_id]["stats"][b.me.username]["dup"] += 1
                                 else: active_smart_jobs[user_id]["stats"][b.me.username]["err"] += 1
-                    except FloodWait as e: await asyncio.sleep(e.value)
-                    except Exception: pass
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                    except Exception:
+                        pass
+                        
+                # Fire all sub-bots simultaneously for this chunk
+                await asyncio.gather(*(process_sub_bot(b) for b in sub_bots))
 
         current_id += chunk_size
         active_smart_jobs[user_id]["current"] = min(current_id, last_msg_id)
@@ -409,12 +415,13 @@ async def execute_smart_multi_index(client, message, state):
         await pool.stop_all(main_bot=client)
 
     elif job_type == 'multiindex':
-        for b in sub_bots:
+        for i in range(0, len(valid_ids), 200):
             if active_smart_jobs[user_id]["cancel"]: break
-            db_name = f"multi_{b.me.username}.db"
-            for i in range(0, len(valid_ids), 200):
-                if active_smart_jobs[user_id]["cancel"]: break
-                chunk = valid_ids[i:i+200]
+            chunk = valid_ids[i:i+200]
+            
+            # Concurrent Fetching for Sub-bots from JSON array
+            async def process_sub_bot_json(b):
+                db_name = f"multi_{b.me.username}.db"
                 try:
                     msgs = await b.get_messages(chat_id, chunk)
                     for m in msgs:
@@ -425,13 +432,17 @@ async def execute_smart_multi_index(client, message, state):
                             if res == 'suc': active_smart_jobs[user_id]["stats"][b.me.username]["saved"] += 1
                             elif res == 'dup': active_smart_jobs[user_id]["stats"][b.me.username]["dup"] += 1
                             else: active_smart_jobs[user_id]["stats"][b.me.username]["err"] += 1
-                    active_smart_jobs[user_id]["current"] = min(i + 200, len(valid_ids))
                 except FloodWait as e:
                     await asyncio.sleep(e.value)
                 except Exception:
                     pass
+            
+            # Fire all bots simultaneously to fetch the exact same chunk
+            await asyncio.gather(*(process_sub_bot_json(b) for b in sub_bots))
+            active_smart_jobs[user_id]["current"] = min(i + 200, len(valid_ids))
+
+        for b in sub_bots:
             await b.stop()
-            active_smart_jobs[user_id]["current"] = 0 # Reset counter for next bot
 
     final_text = f"✔️ **JSON Indexing Completed**\n" if not active_smart_jobs[user_id]["cancel"] else f"🛑 **Cancelled**\n"
     final_text += f"**Chat:** {chat_name}\n**Total Processed:** {len(valid_ids)}"
