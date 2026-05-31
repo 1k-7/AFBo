@@ -7,7 +7,7 @@ import requests
 from hydrogram import Client, filters, enums
 from hydrogram.errors import FloodWait, MessageNotModified
 from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from info import ADMINS, INDEX_EXTENSIONS, LOG_CHANNEL, API_ID, API_HASH
+from info import ADMINS, INDEX_EXTENSIONS, LOG_CHANNEL, API_ID, API_HASH, DATABASE_FILE
 from database.ia_filterdb import save_file, save_file_custom 
 from database.users_chats_db import db as data_db
 from utils import temp, get_readable_time
@@ -33,6 +33,8 @@ class UserbotPool:
         self.api_hash = api_hash
         self.clients = []
         self.cooldowns = {}
+        self.main_bot = main_bot
+        
         if main_bot:
             self.clients.append(main_bot)
             self.cooldowns[main_bot] = 0
@@ -52,13 +54,21 @@ class UserbotPool:
 
     def get_client(self):
         now = time.time()
-        available = [c for c in self.clients if self.cooldowns.get(c, 0) <= now]
-        if available:
-            c = available[0]
+        
+        # Prioritize helpers first
+        helpers = [c for c in self.clients if c != self.main_bot and self.cooldowns.get(c, 0) <= now]
+        if helpers:
+            c = helpers[0]
+            # Rotate helper to the back of the line
             self.clients.remove(c)
             self.clients.append(c)
             return c, 0
-        
+            
+        # Fallback to main bot if all helpers are floodwaited
+        if self.main_bot and self.cooldowns.get(self.main_bot, 0) <= now:
+            return self.main_bot, 0
+            
+        # If absolutely everything is floodwaited, find the shortest cooldown
         min_client = min(self.clients, key=lambda c: self.cooldowns.get(c, 0))
         wait_time = self.cooldowns[min_client] - now
         return min_client, max(0, wait_time)
@@ -84,6 +94,11 @@ def send_error_log(token, text):
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         logger.error(f"Failed to send log via secondary bot: {e}")
+
+def get_multi_db_path(bot_username):
+    # Extracts the directory from DATABASE_FILE to ensure persistent storage
+    db_dir = os.path.dirname(DATABASE_FILE) or "."
+    return os.path.join(db_dir, f"multi_{bot_username}.db")
 
 # ================================
 # SMART & MULTI INDEX ENGINE
@@ -113,7 +128,7 @@ async def init_smart_index(client, message):
     smart_index_state[user_id] = data
     await message.reply("➡️ Forward a message from the target channel or send its link.")
 
-@Client.on_message(filters.private & filters.user(ADMINS) & ~filters.command(["smartindex", "multiindex", "index", "indexhelper", "exportmulti", "start", "help", "stats", "export", "import", "delete", "index_channels"]))
+@Client.on_message(filters.private & filters.user(ADMINS) & ~filters.command(["smartindex", "multiindex", "index", "indexhelper", "exportmulti", "importmulti", "start", "help", "stats", "export", "import", "delete", "index_channels"]))
 async def process_smart_index_state(client, message):
     user_id = message.from_user.id
     if user_id not in smart_index_state: return
@@ -311,7 +326,7 @@ async def execute_smart_scan_and_index(bot, message, state, user_id, job_id):
 
         active_smart_jobs[job_id]["scanned_files"] = len(valid_ids)
 
-        # 2. SAVE PHASE (PARALLELIZED)
+        # 2. SAVE PHASE
         if batch_valid_ids:
             if job_type == 'smartindex':
                 try:
@@ -320,7 +335,7 @@ async def execute_smart_scan_and_index(bot, message, state, user_id, job_id):
                         if m.empty: continue
                         media = getattr(m, m.media.value, None) if m.media else None
                         if media:
-                            res = await save_file(media, replace=True)
+                            res = await save_file(media, replace=False)
                             if res == 'suc': active_smart_jobs[job_id]["stats"]["Main Bot"]["saved"] += 1
                             elif res == 'dup': active_smart_jobs[job_id]["stats"]["Main Bot"]["dup"] += 1
                             else: 
@@ -331,20 +346,25 @@ async def execute_smart_scan_and_index(bot, message, state, user_id, job_id):
                     
             elif job_type == 'multiindex':
                 async def process_sub_bot(b):
-                    db_name = f"multi_{b.me.username}.db"
-                    try:
-                        b_msgs = await b.get_messages(chat_id, batch_valid_ids)
-                        for m in b_msgs:
-                            if m.empty: continue
-                            media = getattr(m, m.media.value, None) if m.media else None
-                            if media:
-                                res = await save_file_custom(media, db_name, replace=True)
-                                if res == 'suc': active_smart_jobs[job_id]["stats"][b.me.username]["saved"] += 1
-                                elif res == 'dup': active_smart_jobs[job_id]["stats"][b.me.username]["dup"] += 1
-                                else: active_smart_jobs[job_id]["stats"][b.me.username]["err"] += 1
-                    except FloodWait as e: await asyncio.sleep(e.value)
-                    except Exception: pass
-                        
+                    db_name = get_multi_db_path(b.me.username)
+                    while True:
+                        if active_smart_jobs[job_id]["cancel"]: break
+                        try:
+                            b_msgs = await b.get_messages(chat_id, batch_valid_ids)
+                            for m in b_msgs:
+                                if m.empty: continue
+                                media = getattr(m, m.media.value, None) if m.media else None
+                                if media:
+                                    res = await save_file_custom(media, db_name, replace=False)
+                                    if res == 'suc': active_smart_jobs[job_id]["stats"][b.me.username]["saved"] += 1
+                                    elif res == 'dup': active_smart_jobs[job_id]["stats"][b.me.username]["dup"] += 1
+                                    else: active_smart_jobs[job_id]["stats"][b.me.username]["err"] += 1
+                            break 
+                        except FloodWait as e:
+                            await asyncio.sleep(e.value + 1)
+                        except Exception:
+                            break 
+                            
                 await asyncio.gather(*(process_sub_bot(b) for b in sub_bots))
 
         current_id += chunk_size
@@ -433,24 +453,28 @@ async def execute_smart_multi_index(client, message, state, user_id, job_id):
                 continue
                 
             chunk = valid_ids[i:i+200]
-            try:
-                msgs = await c.get_messages(chat_id, chunk)
-                for m in msgs:
-                    if m.empty: continue
-                    media = getattr(m, m.media.value, None) if m.media else None
-                    if media:
-                        res = await save_file(media, replace=True)
-                        if res == 'suc': active_smart_jobs[job_id]["stats"]["Main Bot"]["saved"] += 1
-                        elif res == 'dup': active_smart_jobs[job_id]["stats"]["Main Bot"]["dup"] += 1
-                        else: active_smart_jobs[job_id]["stats"]["Main Bot"]["err"] += 1
-                i += 200
-                active_smart_jobs[job_id]["current"] = min(i, len(valid_ids))
-            except FloodWait as e:
-                pool.set_cooldown(c, e.value)
-                continue
-            except Exception:
-                i += 200
-                active_smart_jobs[job_id]["current"] = min(i, len(valid_ids))
+            while True:
+                if active_smart_jobs[job_id]["cancel"]: break
+                try:
+                    msgs = await c.get_messages(chat_id, chunk)
+                    for m in msgs:
+                        if m.empty: continue
+                        media = getattr(m, m.media.value, None) if m.media else None
+                        if media:
+                            res = await save_file(media, replace=False)
+                            if res == 'suc': active_smart_jobs[job_id]["stats"]["Main Bot"]["saved"] += 1
+                            elif res == 'dup': active_smart_jobs[job_id]["stats"]["Main Bot"]["dup"] += 1
+                            else: active_smart_jobs[job_id]["stats"]["Main Bot"]["err"] += 1
+                    break
+                except FloodWait as e:
+                    pool.set_cooldown(c, e.value)
+                    c, wait_time = pool.get_client()
+                    if wait_time > 0: await asyncio.sleep(wait_time)
+                except Exception:
+                    break
+                    
+            i += 200
+            active_smart_jobs[job_id]["current"] = min(i, len(valid_ids))
                 
         await pool.stop_all(main_bot=client)
 
@@ -460,19 +484,24 @@ async def execute_smart_multi_index(client, message, state, user_id, job_id):
             chunk = valid_ids[i:i+200]
             
             async def process_sub_bot_json(b):
-                db_name = f"multi_{b.me.username}.db"
-                try:
-                    msgs = await b.get_messages(chat_id, chunk)
-                    for m in msgs:
-                        if m.empty: continue
-                        media = getattr(m, m.media.value, None) if m.media else None
-                        if media:
-                            res = await save_file_custom(media, db_name, replace=True)
-                            if res == 'suc': active_smart_jobs[job_id]["stats"][b.me.username]["saved"] += 1
-                            elif res == 'dup': active_smart_jobs[job_id]["stats"][b.me.username]["dup"] += 1
-                            else: active_smart_jobs[job_id]["stats"][b.me.username]["err"] += 1
-                except FloodWait as e: await asyncio.sleep(e.value)
-                except Exception: pass
+                db_name = get_multi_db_path(b.me.username)
+                while True:
+                    if active_smart_jobs[job_id]["cancel"]: break
+                    try:
+                        msgs = await b.get_messages(chat_id, chunk)
+                        for m in msgs:
+                            if m.empty: continue
+                            media = getattr(m, m.media.value, None) if m.media else None
+                            if media:
+                                res = await save_file_custom(media, db_name, replace=False)
+                                if res == 'suc': active_smart_jobs[job_id]["stats"][b.me.username]["saved"] += 1
+                                elif res == 'dup': active_smart_jobs[job_id]["stats"][b.me.username]["dup"] += 1
+                                else: active_smart_jobs[job_id]["stats"][b.me.username]["err"] += 1
+                        break
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 1)
+                    except Exception:
+                        break
             
             await asyncio.gather(*(process_sub_bot_json(b) for b in sub_bots))
             active_smart_jobs[job_id]["current"] = min(i + 200, len(valid_ids))
@@ -561,15 +590,17 @@ async def smart_cancel_process(bot, query: CallbackQuery):
 
 @Client.on_message(filters.command('exportmulti') & filters.user(ADMINS))
 async def export_multi_cmd(client, message):
-    db_files = [f for f in os.listdir() if f.startswith("multi_") and f.endswith(".db")]
+    db_dir = os.path.dirname(DATABASE_FILE) or "."
+    db_files = [f for f in os.listdir(db_dir) if f.startswith("multi_") and f.endswith(".db")]
     if not db_files: return await message.reply("❌ No multi-index DBs found.")
     
     sts = await message.reply("⏳ Converting Multi-DBs to JSON...")
     
     import aiosqlite
     for db_file in db_files:
+        full_path = os.path.join(db_dir, db_file)
         try:
-            async with aiosqlite.connect(db_file) as sql_db:
+            async with aiosqlite.connect(full_path) as sql_db:
                 sql_db.row_factory = aiosqlite.Row
                 async with sql_db.execute('SELECT file_id as _id, file_name, file_size, caption FROM files') as cursor:
                     rows = await cursor.fetchall()
@@ -589,6 +620,85 @@ async def export_multi_cmd(client, message):
             
     await sts.delete()
 
+@Client.on_message(filters.command('importmulti') & filters.user(ADMINS))
+async def import_multi_cmd(client, message):
+    if not message.reply_to_message or not message.reply_to_message.document:
+        return await message.reply("Usage: Reply to a multi-index JSON export file with `/importmulti`")
+        
+    doc = message.reply_to_message.document
+    filename = doc.file_name
+    
+    if not filename or not filename.startswith("multi_") or not filename.endswith(".json"):
+        return await message.reply("❌ Unrecognized filename. Must start with 'multi_' and end with '.json'")
+        
+    target_db = filename.replace("_export.json", ".db").replace(".json", ".db")
+    db_dir = os.path.dirname(DATABASE_FILE) or "."
+    full_db_path = os.path.join(db_dir, target_db)
+    
+    msg = await message.reply(f"⏳ Downloading JSON file for `{target_db}`...")
+    
+    try:
+        file_path = await message.reply_to_message.download()
+        await msg.edit(f"⏳ Parsing JSON and importing to `{target_db}`. Please wait...")
+        
+        with open(file_path, "r") as f:
+            docs = json.load(f)
+            
+        if not isinstance(docs, list):
+            raise ValueError("JSON file must contain a list of documents.")
+            
+        import aiosqlite
+        async with aiosqlite.connect(full_db_path) as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS files (
+                    file_id TEXT PRIMARY KEY,
+                    file_name TEXT,
+                    file_size INTEGER,
+                    caption TEXT
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_file_name ON files(file_name)')
+            await db.commit()
+            
+        success = 0; duplicate = 0; errors = 0
+        
+        async with aiosqlite.connect(full_db_path) as sql_db:
+            for doc_item in docs:
+                try:
+                    file_id = doc_item.get('_id') or doc_item.get('file_id')
+                    file_name = doc_item.get('file_name', '')
+                    file_size = doc_item.get('file_size', 0)
+                    caption = doc_item.get('caption', '')
+                    
+                    if not file_id:
+                        errors += 1
+                        continue
+                        
+                    await sql_db.execute(
+                        'INSERT INTO files (file_id, file_name, file_size, caption) VALUES (?, ?, ?, ?)', 
+                        (file_id, file_name, file_size, caption)
+                    )
+                    success += 1
+                except aiosqlite.IntegrityError:
+                    duplicate += 1
+                except Exception:
+                    errors += 1
+            await sql_db.commit()
+
+        os.remove(file_path)
+        await msg.edit(
+            f"✔️ **Import Complete for `{target_db}`**\n\n"
+            f"Total Processed: {len(docs)}\n"
+            f"Successfully Inserted: {success}\n"
+            f"Skipped (Duplicates): {duplicate}\n"
+            f"Errors: {errors}"
+        )
+        
+    except Exception as e:
+        logger.error(f"ImportMulti Error: {e}", exc_info=True)
+        await msg.edit(f"❌ Error during import: {e}")
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.remove(file_path)
 
 # ================================
 # BASIC INDEX ENGINE (Queue)
@@ -652,12 +762,12 @@ async def index_files_callback(bot, query: CallbackQuery):
         index_queue.append(job_data)
         queue_pos = len(index_queue)
         await query.message.edit(f"✅ Added to Indexing Queue! Position: {queue_pos}")
-        if not is_indexing: asyncio.create_task(process_index_queue(bot))
+        if not is_indexing: asyncio.create_task(process_index_queue_fallback(bot))
     elif ident == 'cancel':
         temp.CANCEL = True
         await query.answer("Cancellation requested for current job.", show_alert=True)
 
-async def process_index_queue(bot):
+async def process_index_queue_fallback(bot):
     global index_queue, is_indexing, current_index_job
     if is_indexing: return
     is_indexing = True
@@ -683,10 +793,6 @@ async def execute_index_job(bot, job):
     
     stg = await data_db.get_bot_sttgs()
     sec_token = stg.get('SECONDARY_BOT_TOKEN')
-    sessions = stg.get("INDEX_SESSIONS", [])
-    
-    pool = UserbotPool(sessions, API_ID, API_HASH, main_bot=bot)
-    await pool.start_all()
     
     SAVE_BATCH_SIZE = 100
     temp.CANCEL = False
@@ -699,16 +805,11 @@ async def execute_index_job(bot, job):
         while current_id <= lst_msg_id:
             if temp.CANCEL: break
             
-            c, wait_time = pool.get_client()
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-                continue
-                
             chunk_size = min(200, lst_msg_id - current_id + 1)
             chunk_ids = list(range(current_id, current_id + chunk_size))
             
             try:
-                msgs = await c.get_messages(chat_id, chunk_ids)
+                msgs = await bot.get_messages(chat_id, chunk_ids)
                 for message in msgs:
                     current_index_job["current"] = message.id
                     if message.empty: current_index_job["deleted"] += 1; continue
@@ -730,7 +831,7 @@ async def execute_index_job(bot, job):
                         
                 current_id += chunk_size
             except FloodWait as e:
-                pool.set_cooldown(c, e.value)
+                await asyncio.sleep(e.value + 1)
                 continue
             except Exception:
                 current_id += chunk_size
@@ -754,7 +855,6 @@ async def execute_index_job(bot, job):
         except: pass
     finally:
         temp.CANCEL = False
-        await pool.stop_all(main_bot=bot)
 
 @Client.on_callback_query(filters.regex(r"^index_status$"))
 async def index_status_update(bot, query: CallbackQuery):
