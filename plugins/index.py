@@ -71,7 +71,6 @@ class UserbotPool:
                 try: await c.stop()
                 except: pass
 
-
 def send_error_log(token, text):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -140,8 +139,8 @@ async def process_smart_index_state(client, message):
         state['last_msg_id'] = last_msg_id
         state['step'] = 'get_json'
         
-        btn = [[InlineKeyboardButton("❌ No JSON (Scan with Userbots)", callback_data=f"no_json_{user_id}")]]
-        await message.reply(f"**Target:** {chat_name}\n\nSend the JSON backup file if you have it. Otherwise, click 'No JSON'.", reply_markup=InlineKeyboardMarkup(btn))
+        btn = [[InlineKeyboardButton("❌ No JSON (Scan & Index Dynamically)", callback_data=f"no_json_{user_id}")]]
+        await message.reply(f"**Target:** {chat_name}\n\nSend the JSON backup file if you have it. Otherwise, click the button below to scan and index on the fly.", reply_markup=InlineKeyboardMarkup(btn))
 
     elif step == 'get_json':
         if message.document and message.document.file_name.endswith('.json'):
@@ -156,18 +155,19 @@ async def process_smart_index_state(client, message):
                 await message.reply(f"❌ Error reading JSON: {e}")
             del smart_index_state[user_id]
         else:
-            await message.reply("Please send a valid JSON file, or click 'No JSON' above.")
+            await message.reply("Please send a valid JSON file, or click the button above.")
 
 @Client.on_callback_query(filters.regex(r'^no_json_'))
 async def handle_no_json(bot, query: CallbackQuery):
     user_id = query.from_user.id
     if user_id not in smart_index_state: return await query.answer("State expired.", show_alert=True)
     
-    await query.message.edit("Initiating Userbot Scanning Phase...")
+    await query.message.edit("Initiating Dynamic Scan & Index Phase...")
     state = smart_index_state[user_id]
     chat_id = state['chat_id']
     chat_name = state['chat_name']
     last_msg_id = state['last_msg_id']
+    job_type = state['type']
     
     stg = await data_db.get_bot_sttgs()
     sessions = stg.get("INDEX_SESSIONS", [])
@@ -179,13 +179,28 @@ async def handle_no_json(bot, query: CallbackQuery):
         try:
             invite_link = await bot.create_chat_invite_link(chat_id)
             await pool.join_chat(invite_link.invite_link)
-        except Exception as e: pass
+        except Exception: pass
+
+    sub_bots = []
+    if job_type == 'multiindex':
+        tokens = state['tokens']
+        for token in tokens:
+            try:
+                b = Client(f"sub_{token.split(':')[0]}", bot_token=token, api_id=API_ID, api_hash=API_HASH, in_memory=True)
+                await b.start()
+                sub_bots.append(b)
+            except Exception as e:
+                await query.message.reply(f"❌ Failed to start sub-bot: {e}")
+        if not sub_bots:
+            await pool.stop_all(main_bot=bot)
+            return await query.message.edit("❌ No active sub-bots. Aborting.")
             
     valid_ids = []
     chunk_size = 200
     current_id = 1
+    saved_files = 0
     
-    sts = await query.message.reply(f"🔎 Scanning `{chat_name}` with {helpers_count} helpers...")
+    sts = await query.message.reply(f"🚀 **Dynamic Indexing `{chat_name}`**\nHelpers: {helpers_count}\nSub-bots: {len(sub_bots)}\n\nFetching and saving simultaneously...")
     
     while current_id <= last_msg_id:
         c, wait_time = pool.get_client()
@@ -194,6 +209,9 @@ async def handle_no_json(bot, query: CallbackQuery):
             continue
             
         chunk = list(range(current_id, min(current_id + chunk_size, last_msg_id + 1)))
+        batch_valid_ids = []
+        
+        # 1. SCAN PHASE (Userbot finds messages with media)
         try:
             msgs = await c.get_messages(chat_id, chunk)
             for m in msgs:
@@ -202,28 +220,62 @@ async def handle_no_json(bot, query: CallbackQuery):
                     media = getattr(m, m.media.value, None)
                     if media and getattr(media, 'file_name', None):
                         if any(media.file_name.lower().endswith(ext) for ext in INDEX_EXTENSIONS):
+                            batch_valid_ids.append(m.id)
                             valid_ids.append(m.id)
-            current_id += chunk_size
-            if current_id % 2000 == 0 or current_id >= last_msg_id:
-                try: await sts.edit(f"🔎 Scanning `{chat_name}`... ({current_id}/{last_msg_id})")
-                except: pass
         except FloodWait as e:
             pool.set_cooldown(c, e.value)
             continue
         except Exception:
-            current_id += chunk_size
+            pass
+
+        # 2. SAVE PHASE (Bots grab the specific valid files directly)
+        if batch_valid_ids:
+            if job_type == 'smartindex':
+                try:
+                    bot_msgs = await bot.get_messages(chat_id, batch_valid_ids)
+                    for m in bot_msgs:
+                        if m.empty: continue
+                        media = getattr(m, m.media.value, None) if m.media else None
+                        if media:
+                            res = await save_file(media, replace=True)
+                            if res == 'suc': saved_files += 1
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                    
+            elif job_type == 'multiindex':
+                for b in sub_bots:
+                    db_name = f"multi_{b.me.username}.db"
+                    try:
+                        b_msgs = await b.get_messages(chat_id, batch_valid_ids)
+                        for m in b_msgs:
+                            if m.empty: continue
+                            media = getattr(m, m.media.value, None) if m.media else None
+                            if media:
+                                res = await save_file_custom(media, db_name, replace=True)
+                                if res == 'suc' and b == sub_bots[0]: saved_files += 1 
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                    except Exception:
+                        pass
+
+        current_id += chunk_size
+        
+        # Update progress 
+        if current_id % 1000 < chunk_size or current_id >= last_msg_id:
+            try: await sts.edit(f"🚀 **Dynamic Indexing...**\n\n**Progress:** {min(current_id, last_msg_id)} / {last_msg_id}\n**Saved Files:** {saved_files}")
+            except: pass
 
     await pool.stop_all(main_bot=bot)
-    
+    for b in sub_bots:
+        try: await b.stop()
+        except: pass
+        
     json_file = f"{chat_name}_{chat_id}.json".replace(" ", "_")
     with open(json_file, "w") as f:
         json.dump(valid_ids, f)
         
-    await query.message.reply_document(json_file, caption=f"✔️ Backup generated! Found {len(valid_ids)} files.")
+    await query.message.reply_document(json_file, caption=f"✔️ Completed! Total Valid Files: {len(valid_ids)}\nSaved to DB(s) successfully.")
     os.remove(json_file)
-    
-    state['valid_ids'] = valid_ids
-    await execute_smart_multi_index(bot, sts, state)
     del smart_index_state[user_id]
 
 
@@ -235,7 +287,7 @@ async def execute_smart_multi_index(client, message, state):
     if not valid_ids:
         return await message.reply("❌ No valid files to index.")
         
-    sts = await message.reply(f"🚀 Starting File ID Fetching Phase for {len(valid_ids)} files...")
+    sts = await message.reply(f"🚀 Starting File ID Fetching Phase for {len(valid_ids)} files from JSON...")
     
     if job_type == 'smartindex':
         stg = await data_db.get_bot_sttgs()
@@ -267,7 +319,7 @@ async def execute_smart_multi_index(client, message, state):
             except FloodWait as e:
                 pool.set_cooldown(c, e.value)
                 continue
-            except Exception as e:
+            except Exception:
                 i += 200
                 
         await pool.stop_all(main_bot=client)
@@ -306,7 +358,7 @@ async def execute_smart_multi_index(client, message, state):
                             if res == 'suc': saved += 1
                 except FloodWait as e:
                     await asyncio.sleep(e.value)
-                except Exception as e:
+                except Exception:
                     pass
             await bot_sts.edit(f"✔️ Finished @{b.me.username} - Saved {saved} files to `{db_name}`.")
             await b.stop()
@@ -342,10 +394,6 @@ async def export_multi_cmd(client, message):
             await message.reply(f"❌ Error exporting {db_file}: {e}")
             
     await sts.delete()
-
-# ================================
-# BASIC INDEX ENGINE (Queue)
-# ================================
 
 @Client.on_message(filters.command(['index', 'indexrc']) & filters.private & filters.user(ADMINS))
 async def send_for_index(bot, message):
@@ -485,7 +533,7 @@ async def execute_index_job(bot, job):
             except FloodWait as e:
                 pool.set_cooldown(c, e.value)
                 continue
-            except Exception as e:
+            except Exception:
                 current_id += chunk_size
                 
         if save_tasks:
